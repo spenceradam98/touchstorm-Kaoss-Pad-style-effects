@@ -10,12 +10,16 @@ on:
 env:
   NAME: Touchstorm
 
+concurrency:
+  group: build-${{ github.sha }}
+  cancel-in-progress: true
+
 jobs:
   mac:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Configure (universal x86_64 + arm64)
+      - name: Configure (universal x86_64 + arm64, macOS 11 minimum)
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
       - name: Build
         run: cmake --build build --config Release --parallel 4
@@ -33,22 +37,40 @@ jobs:
           exit $fail
       - name: Engine tests
         run: ctest --test-dir build -C Release --output-on-failure
-      - name: Ad-hoc sign and zip
+      - name: Ad-hoc sign
         run: |
-          mkdir dist
           shopt -s nullglob
           for b in build/*_artefacts/Release/VST3/*.vst3 build/*_artefacts/Release/AU/*.component \
                    build/*_artefacts/Release/Standalone/*.app build/*_artefacts/Release/*.app; do
-            lipo -info "$(find "$b/Contents/MacOS" -type f | head -1)"
             codesign --force --deep --sign - "$b"
-            ditto -c -k --keepParent "$b" "dist/$(basename "$b" | tr ' ' '-')-mac.zip"
           done
+      - name: Make .pkg installer
+        run: |
+          set -e
+          shopt -s nullglob
+          VERSION=$(grep -m1 -oE 'project\([^)]*VERSION [0-9.]+' CMakeLists.txt | grep -oE '[0-9.]+$')
+          ID=com.spenceradam98.$(echo "$NAME" | tr 'A-Z' 'a-z')
+          mkdir -p dist pkgs
+          stage() { # $1 = label, $2 = install location, rest = bundles
+            local label=$1 loc=$2; shift 2
+            [ $# -eq 0 ] && return 0
+            local root="stage/$label"; mkdir -p "$root"
+            for b in "$@"; do ditto "$b" "$root/$(basename "$b")"; done
+            pkgbuild --analyze --root "$root" "stage/$label.plist"
+            i=0; while /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "stage/$label.plist" 2>/dev/null; do i=$((i+1)); done
+            pkgbuild --root "$root" --component-plist "stage/$label.plist" --install-location "$loc" \
+                     --identifier "$ID.$label" --version "$VERSION" "pkgs/$label.pkg"
+          }
+          stage vst3 "/Library/Audio/Plug-Ins/VST3" build/*_artefacts/Release/VST3/*.vst3
+          stage au "/Library/Audio/Plug-Ins/Components" build/*_artefacts/Release/AU/*.component
+          stage app "/Applications" build/*_artefacts/Release/Standalone/*.app build/*_artefacts/Release/*.app
+          args=(); for p in pkgs/*.pkg; do args+=(--package "$p"); done
+          productbuild "${args[@]}" "dist/$NAME-$VERSION-macOS.pkg"
           ls -l dist
-          test -n "$(ls dist)"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}-mac
-          path: dist/*.zip
+          path: dist/*.pkg
 
   windows:
     runs-on: windows-2022
@@ -60,20 +82,69 @@ jobs:
         run: cmake --build build --config Release --parallel 4
       - name: Engine tests
         run: ctest --test-dir build -C Release --output-on-failure
-      - name: Zip
+      - name: Install Inno Setup
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          $items = @(Get-ChildItem build/*_artefacts/Release/VST3/*.vst3 -ErrorAction SilentlyContinue) +
-                   @(Get-ChildItem build/*_artefacts/Release/Standalone/*.exe -ErrorAction SilentlyContinue) +
-                   @(Get-ChildItem build/*_artefacts/Release/*.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Test' })
-          foreach ($i in $items) {
-            $zip = "dist/" + ($i.BaseName -replace ' ', '-') + $i.Extension.Replace('.', '-') + "-windows.zip"
-            Compress-Archive -Path $i.FullName -DestinationPath $zip -Force
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - name: Make Setup.exe
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path CMakeLists.txt -Pattern 'project\([^)]*VERSION ([0-9.]+)' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $vst3 = @(Get-ChildItem build/*_artefacts/Release/VST3/*.vst3 -ErrorAction SilentlyContinue)
+          $apps = @(Get-ChildItem build/*_artefacts/Release/Standalone/*.exe -ErrorAction SilentlyContinue) +
+                  @(Get-ChildItem build/*_artefacts/Release/*.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Test' })
+          $files = @(); $icons = @()
+          foreach ($v in $vst3) { $files += "Source: `"$($v.FullName)\*`"; DestDir: `"{commoncf64}\VST3\$($v.Name)`"; Flags: ignoreversion recursesubdirs createallsubdirs" }
+          foreach ($a in $apps) {
+            $files += "Source: `"$($a.FullName)`"; DestDir: `"{app}`"; Flags: ignoreversion"
+            $icons += "Name: `"{group}\$($a.BaseName)`"; Filename: `"{app}\$($a.Name)`""
           }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $iss = @"
+          [Setup]
+          AppId=com.spenceradam98.$($env:NAME.ToLower())
+          AppName=$env:NAME
+          AppVersion=$version
+          AppPublisher=spenceradam98
+          DefaultDirName={autopf}\$env:NAME
+          DefaultGroupName=$env:NAME
+          DisableProgramGroupPage=yes
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          PrivilegesRequired=admin
+          OutputDir=$((Resolve-Path dist).Path)
+          OutputBaseFilename=$env:NAME-$version-Windows-Setup
+          Compression=lzma2
+          SolidCompression=yes
+
+          [Files]
+          $($files -join "`r`n")
+
+          [Icons]
+          $($icons -join "`r`n")
+          "@
+          $iss = ($iss -split "`n" | ForEach-Object { $_.TrimStart() }) -join "`r`n"
+          Set-Content -Path installer.iss -Value $iss -Encoding UTF8
+          Get-Content installer.iss
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Get-ChildItem dist
-          if ((Get-ChildItem dist).Count -eq 0) { exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.NAME }}-windows
-          path: dist/*.zip
+          path: dist/*.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
