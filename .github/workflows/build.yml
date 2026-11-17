@@ -1,0 +1,67 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  NAME: Touchstorm
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (universal x86_64 + arm64)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Engine tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Ad-hoc sign and zip
+        run: |
+          mkdir dist
+          shopt -s nullglob
+          for b in build/*_artefacts/Release/VST3/*.vst3 build/*_artefacts/Release/AU/*.component \
+                   build/*_artefacts/Release/Standalone/*.app build/*_artefacts/Release/*.app; do
+            lipo -info "$(find "$b/Contents/MacOS" -type f | head -1)"
+            codesign --force --deep --sign - "$b"
+            ditto -c -k --keepParent "$b" "dist/$(basename "$b" | tr ' ' '-')-mac.zip"
+          done
+          ls -l dist
+          test -n "$(ls dist)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-mac
+          path: dist/*.zip
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build
+        run: cmake --build build --config Release --parallel 4
+      - name: Engine tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $items = @(Get-ChildItem build/*_artefacts/Release/VST3/*.vst3 -ErrorAction SilentlyContinue) +
+                   @(Get-ChildItem build/*_artefacts/Release/Standalone/*.exe -ErrorAction SilentlyContinue) +
+                   @(Get-ChildItem build/*_artefacts/Release/*.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'Test' })
+          foreach ($i in $items) {
+            $zip = "dist/" + ($i.BaseName -replace ' ', '-') + $i.Extension.Replace('.', '-') + "-windows.zip"
+            Compress-Archive -Path $i.FullName -DestinationPath $zip -Force
+          }
+          Get-ChildItem dist
+          if ((Get-ChildItem dist).Count -eq 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-windows
+          path: dist/*.zip
