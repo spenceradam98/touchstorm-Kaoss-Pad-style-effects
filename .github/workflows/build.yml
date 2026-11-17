@@ -12,13 +12,25 @@ env:
 
 jobs:
   mac:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Configure (universal x86_64 + arm64)
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
       - name: Build
         run: cmake --build build --config Release --parallel 4
+      - name: Verify binaries run on macOS 11 (universal, minos <= 11.0)
+        run: |
+          fail=0
+          while IFS= read -r -d '' f; do
+            minos=$(otool -arch all -l "$f" | awk '/LC_BUILD_VERSION/{m=1} /LC_VERSION_MIN_MACOSX/{v=1} m&&$1=="minos"{print $2; m=0} v&&$1=="version"{print $2; v=0}' | sort -V | tail -1)
+            archs=$(lipo -archs "$f")
+            echo "$f -> minos $minos, archs $archs"
+            [ -n "$minos" ] && [ "$(printf '%s\n11.0\n' "$minos" | sort -V | tail -1)" = "11.0" ] || { echo "::error::$f needs macOS $minos"; fail=1; }
+            case " $archs " in *x86_64*) ;; *) echo "::error::$f has no Intel slice"; fail=1;; esac
+            case " $archs " in *arm64*) ;; *) echo "::error::$f has no Apple Silicon slice"; fail=1;; esac
+          done < <(find build -path '*_artefacts/Release/*' -path '*/Contents/MacOS/*' -type f -print0)
+          exit $fail
       - name: Engine tests
         run: ctest --test-dir build -C Release --output-on-failure
       - name: Ad-hoc sign and zip
