@@ -81,7 +81,8 @@ struct Grain
 struct Bank
 {
     std::vector<float> l, r;
-    int len = 0, pos = 0, target = 0;
+    int len = 0, pos = 0, target = 0, beats = 4;
+    double startBeat = 0;   // host beat where the recording started (bar-locked playback)
     std::atomic<int> state { (int) BankState::Empty };
     std::atomic<bool> reversed { false };
     std::atomic<float> progress { 0.0f };
@@ -132,6 +133,22 @@ struct Engine::Impl
     Smoother gate;
     float shimmerPrev[2] {};
     BlepOsc osc[4];
+
+    // vocoder: 16 analysis/synthesis band pairs
+    static constexpr int kBands = 16;
+    Svf vocMod[kBands], vocCar[kBands];
+    EnvFollower vocEnv[kBands];
+    EnvFollower scLevel;
+    OnePole vocHp;
+
+    // drum voices for Drum Roll / Beat Loop
+    struct Drums
+    {
+        float kAmp = 0, kPitch = 0, kPh = 0, sAmp = 0, sTone = 0, sPh = 0, hAmp = 0;
+        float kDec = 0, kPDec = 0, sDec = 0, stDec = 0, hDec = 0, tune = 1.0f;
+        OnePole hp1, hp2, sHp;
+    } drums;
+    int64_t lastStep = -1;
     Svf synthF[2];
     float synthPhase = 0, holdL = 0, holdR = 0, holdCount = 0;
     float crackle = 0;
@@ -158,6 +175,12 @@ struct Engine::Impl
             ps2[c].allocate ((int) (0.15 * sr));
         }
         rev.prepare (sr);
+        scLevel.set (sr, 5.0f, 300.0f);
+        vocHp.set (sr, 3000.0f);
+        for (int i = 0; i < kBands; ++i) vocEnv[i].set (sr, 4.0f, 40.0f);
+        auto dec = [this] (float seconds) { return std::exp (-6.9f / (seconds * (float) sr)); };   // -60 dB in `seconds`
+        drums.kDec = dec (0.45f); drums.kPDec = dec (0.05f); drums.sDec = dec (0.22f); drums.stDec = dec (0.10f); drums.hDec = dec (0.06f);
+        drums.hp1.set (sr, 7000.0f); drums.hp2.set (sr, 7000.0f); drums.sHp.set (sr, 1200.0f);
         cap.allocate ((int) (10.0 * sr));
         env.set (sr, 3.0f, 120.0f);
         gateEnv.set (sr, 1.0f, 60.0f);
@@ -188,6 +211,9 @@ struct Engine::Impl
             phaserFb[c] = 0; shimmerPrev[c] = 0;
         }
         rev.clear();
+        for (int i = 0; i < kBands; ++i) { vocMod[i].reset(); vocCar[i].reset(); vocEnv[i].env = 0; }
+        drums.kAmp = drums.sAmp = drums.hAmp = 0;
+        lastStep = -1;
         for (auto& g : grains) g.on = false;
         frozen = false;
         tapeSpeed = 1.0f;
@@ -217,6 +243,8 @@ struct Engine::Impl
                         if ((BankState) b.state.load() == BankState::Armed) { b.state.store ((int) BankState::Empty); break; }
                         b.target = std::min ((int) b.l.size(), (int) beatsToSamples ((float) std::max (1, p.bankBeats)));
                         b.len = 0;
+                        b.beats = std::max (1, p.bankBeats);
+                        b.startBeat = 0;
                         b.state.store ((int) (p.hostPlaying ? BankState::Armed : BankState::Recording));
                         break;
                     case BankState::Recording: finishRecording (b); break;
@@ -247,6 +275,13 @@ struct Engine::Impl
         for (auto& b : banks)
         {
             if ((BankState) b.state.load() != BankState::Playing || b.len <= 0) continue;
+            if (p.hostPlaying)
+            {
+                // locked to the host: the loop position follows the song position
+                double ph = std::fmod (beatPos - b.startBeat, (double) b.beats);
+                if (ph < 0) ph += b.beats;
+                b.pos = std::min (b.len - 1, (int) (ph / b.beats * b.len));
+            }
             const int i = b.reversed.load() ? b.len - 1 - b.pos : b.pos;
             l += b.l[(size_t) i] * lvl;
             r += b.r[(size_t) i] * lvl;
@@ -259,7 +294,17 @@ struct Engine::Impl
         for (auto& b : banks)
         {
             auto st = (BankState) b.state.load();
-            if (st == BankState::Armed && beatTick) { st = BankState::Recording; b.state.store ((int) st); }
+            if (st == BankState::Armed && beatTick)
+            {
+                // loops of a bar or more start on a downbeat (4/4), shorter ones on the next beat
+                const double beat = std::floor (beatPos + 1e-9);
+                const bool onBar = std::fmod (beat, 4.0) < 0.5;
+                if (b.beats < 4 || onBar)
+                {
+                    st = BankState::Recording; b.state.store ((int) st);
+                    b.startBeat = beat;
+                }
+            }
             if (st != BankState::Recording) continue;
             b.l[(size_t) b.len] = l; b.r[(size_t) b.len] = r;
             if (++b.len >= b.target) finishRecording (b);
@@ -926,16 +971,112 @@ struct Engine::Impl
                 out[0] = f[0].bp; out[1] = f[1].bp;
                 break;
             }
+            case Algo::Vocoder:
+            {
+                // carrier: the sidechain when something is playing into it, otherwise a built-in
+                // saw chord on the pad note (X, quantised to the key/scale)
+                const bool external = scLevel.tick (scSample) > 0.002f;
+                float car;
+                if (external) car = scSample;
+                else
+                {
+                    const int n = scaleSize (p.scale);
+                    const float note = 48.0f + (float) p.key + (float) degreeToSemis (p.scale, stepOf (x, 2 * n + 1));
+                    const float hz = midiToHz (note);
+                    car = 0.35f * (osc[0].saw (hz / fs) + osc[1].saw (hz * 1.005f / fs) + 0.6f * osc[2].saw (hz * 2.0f / fs));
+                }
+                car += rng.next() * 0.02f;   // a little noise so consonants come through
+                const float mod = 0.5f * (in[0] + in[1]);
+                const float shift = std::pow (2.0f, (y - 0.5f) * 2.0f);   // formant shift 0.5x .. 2x
+                float acc = 0;
+                for (int b = 0; b < kBands; ++b)
+                {
+                    const float hz = 100.0f * std::pow (80.0f, (float) b / (float) (kBands - 1));   // 100 Hz .. 8 kHz
+                    vocMod[b].set (sr, hz, 6.0f);
+                    vocCar[b].set (sr, hz * shift, 6.0f);
+                    vocMod[b].tick (mod);
+                    vocCar[b].tick (car);
+                    acc += vocCar[b].bp * vocEnv[b].tick (vocMod[b].bp);
+                }
+                const float sib = vocHp.hpf (mod) * 0.6f;   // pass the input's sibilance
+                out[0] = out[1] = softClip (acc * 1.2f + sib);
+                break;
+            }
+            case Algo::DrumRoll:
+            case Algo::BeatLoop:
+            {
+                auto& d = drums;
+                if (act > 0.5f)
+                {
+                    const float stepBeats = a == Algo::DrumRoll ? kSliceBeats[stepOf (x, 5)] : 0.25f;
+                    const int64_t step = (int64_t) std::floor (beatPos / stepBeats);
+                    if (step != lastStep)
+                    {
+                        const bool first = lastStep < 0;
+                        lastStep = step;
+                        bool k = false, sn = false, h = false;
+                        if (a == Algo::DrumRoll)
+                        {
+                            const int zone = stepOf (y, 3);   // bottom kick, middle snare, top hat
+                            k = zone == 0; sn = zone == 1; h = zone == 2;
+                            d.tune = 0.8f + 0.5f * (y * 3.0f - (float) zone);
+                        }
+                        else
+                        {
+                            // 16-step patterns: kick / snare / hat
+                            static const char* pats[8][3] = {
+                                { "x...x...x...x...", "....x.......x...", "..x...x...x...x." },   // four on the floor
+                                { "x.........x.....", "....x.......x...", "x.x.x.x.x.x.x.x." },   // break
+                                { "x......x..x.....", "....x.......x...", "x.x.x.x.x.x.x.x." },   // hip hop
+                                { "x..........x....", "........x.......", "x.x.x.x.x.x.x.x." },   // half time
+                                { "x.........x.....", "....x..x....x...", "xxxxxxxxxxxxxxxx" },   // drum and bass
+                                { "x...x...x...x...", "................", "xxxxxxxxxxxxxxxx" },   // techno
+                                { "x.....x...x.....", "....x.......x...", "..x...x...x...x." },   // electro
+                                { "x.......x.......", "....x.......x...", "x..xx..xx..xx..x" },   // shuffle
+                            };
+                            const int pat = stepOf (x, 8), st = (int) (((step % 16) + 16) % 16);
+                            k = pats[pat][0][st] == 'x'; sn = pats[pat][1][st] == 'x'; h = pats[pat][2][st] == 'x';
+                            if (first && ! (k || sn || h)) k = true;   // always answer the touch
+                            d.tune = 0.75f + 0.6f * y;
+                        }
+                        if (k) { d.kAmp = 1.0f; d.kPitch = 1.0f; d.kPh = 0; }
+                        if (sn) { d.sAmp = 0.8f; d.sTone = 0.7f; }
+                        if (h) d.hAmp = 0.5f;
+                    }
+                }
+                else lastStep = -1;
+                const float kHz = (48.0f + 160.0f * d.kPitch) * d.tune;
+                d.kPh += kHz / fs; if (d.kPh >= 1.0f) d.kPh -= 1.0f;
+                const float kick = std::sin (kTwoPi * d.kPh) * d.kAmp;
+                d.sPh += 190.0f * d.tune / fs; if (d.sPh >= 1.0f) d.sPh -= 1.0f;
+                const float noise = rng.next();
+                const float snare = d.sHp.hpf (noise) * d.sAmp * 0.7f + std::sin (kTwoPi * d.sPh) * d.sTone * 0.5f;
+                const float hat = d.hp2.hpf (d.hp1.hpf (noise)) * d.hAmp * 1.2f;
+                d.kAmp *= d.kDec; d.kPitch *= d.kPDec; d.sAmp *= d.sDec; d.sTone *= d.stDec; d.hAmp *= d.hDec;
+                const float bright = a == Algo::BeatLoop ? lerpf (0.4f, 1.0f, y) : 1.0f;
+                out[0] = softClip (kick * 0.9f + snare * bright + hat * bright * 0.8f);
+                out[1] = softClip (kick * 0.9f + snare * bright + hat * bright * 1.0f);
+                break;
+            }
             case Algo::Count: break;
         }
         wl = out[0]; wr = out[1];
     }
 
-    static bool isSynth (Algo a) { return a == Algo::LeadSynth || a == Algo::BassSynth || a == Algo::Drone || a == Algo::Siren || a == Algo::NoiseRiser; }
+    static bool isSynth (Algo a)
+    {
+        return a == Algo::LeadSynth || a == Algo::BassSynth || a == Algo::Drone || a == Algo::Siren || a == Algo::NoiseRiser
+            || a == Algo::DrumRoll || a == Algo::BeatLoop;
+    }
     static bool usesFreeze (Algo a) { return a == Algo::BeatRepeat || a == Algo::ReverseLoop || a == Algo::Freeze || a == Algo::Scratch; }
 
-    void process (float* L, float* R, int n, Engine& owner)
+    const float* scL = nullptr;
+    const float* scR = nullptr;
+    float scSample = 0;
+
+    void process (float* L, float* R, int n, Engine& owner, const float* sideL, const float* sideR)
     {
+        scL = sideL; scR = sideR != nullptr ? sideR : sideL;
         int count = 0;
         auto* progs = programs (count);
         serviceBankEvents();
@@ -980,6 +1121,7 @@ struct Engine::Impl
             const float x = sx.next(), y = sy.next();
             const float depth = depthS.next(), ig = inGain.next(), og = outGain.next();
 
+            scSample = scL != nullptr ? 0.5f * (scL[i] + scR[i]) : 0.0f;
             float dryL = L[i] * ig, dryR = R[i] * ig;
             inPk = std::max (inPk, std::max (std::fabs (dryL), std::fabs (dryR)));
             if (! p.resample) bankRecordPending (dryL, dryR);
@@ -1044,7 +1186,10 @@ Engine::~Engine() = default;
 
 void Engine::prepare (double sampleRate, int maxBlock) { sr = sampleRate; impl->prepare (sampleRate, maxBlock); }
 void Engine::setParams (const Params& p) { impl->p = p; }
-void Engine::process (float* left, float* right, int numSamples) { impl->process (left, right, numSamples, *this); }
+void Engine::process (float* left, float* right, int numSamples, const float* sideL, const float* sideR)
+{
+    impl->process (left, right, numSamples, *this, sideL, sideR);
+}
 
 void Engine::bankPress (int b) { if (b >= 0 && b < 4) impl->banks[b].pressCount.fetch_add (1); }
 void Engine::bankClear (int b) { if (b >= 0 && b < 4) impl->banks[b].clearCount.fetch_add (1); }

@@ -40,7 +40,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout TouchstormProcessor::createL
 TouchstormProcessor::TouchstormProcessor()
     : AudioProcessor (BusesProperties()
                           .withInput ("Input", juce::AudioChannelSet::stereo(), true)
-                          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+                          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
+                          .withInput ("Sidechain", juce::AudioChannelSet::stereo(), false)),
       apvts (*this, nullptr, "Touchstorm", createLayout())
 {
 }
@@ -51,13 +52,20 @@ bool TouchstormProcessor::isBusesLayoutSupported (const BusesLayout& layouts) co
     const auto in = layouts.getMainInputChannelSet();
     const bool okOut = out == juce::AudioChannelSet::mono() || out == juce::AudioChannelSet::stereo();
     const bool okIn = in == juce::AudioChannelSet::mono() || in == juce::AudioChannelSet::stereo() || in.isDisabled();
-    return okOut && okIn;
+    bool okSc = true;
+    if (layouts.inputBuses.size() > 1)
+    {
+        const auto sc = layouts.getChannelSet (true, 1);
+        okSc = sc.isDisabled() || sc == juce::AudioChannelSet::mono() || sc == juce::AudioChannelSet::stereo();
+    }
+    return okOut && okIn && okSc;
 }
 
 void TouchstormProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     engine.setParams (readParams());
     engine.prepare (sampleRate, samplesPerBlock);
+    sideChain.setSize (2, juce::jmax (1, samplesPerBlock));
 }
 
 ts::Params TouchstormProcessor::readParams()
@@ -139,7 +147,20 @@ void TouchstormProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     midi.clear();
 
     const int n = buffer.getNumSamples();
-    const int inCh = getTotalNumInputChannels(), outCh = getTotalNumOutputChannels();
+    const int inCh = getMainBusNumInputChannels(), outCh = getMainBusNumOutputChannels();
+
+    // sidechain (vocoder carrier): copy it out before the main channels are touched
+    const float* scL = nullptr;
+    const float* scR = nullptr;
+    if (auto* scBus = getBus (true, 1); scBus != nullptr && scBus->isEnabled() && scBus->getNumberOfChannels() > 0)
+    {
+        auto sc = getBusBuffer (buffer, true, 1);
+        sideChain.setSize (2, n, false, false, true);
+        sideChain.copyFrom (0, 0, sc, 0, 0, n);
+        sideChain.copyFrom (1, 0, sc, sc.getNumChannels() > 1 ? 1 : 0, 0, n);
+        scL = sideChain.getReadPointer (0);
+        scR = sideChain.getReadPointer (1);
+    }
     if (outCh == 0) return;
     if (inCh == 0) buffer.clear();
     else if (inCh == 1 && outCh > 1) buffer.copyFrom (1, 0, buffer, 0, 0, n);
@@ -148,13 +169,13 @@ void TouchstormProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     engine.setParams (readParams());
     float* l = buffer.getWritePointer (0);
     float* r = outCh > 1 ? buffer.getWritePointer (1) : nullptr;
-    if (r != nullptr) engine.process (l, r, n);
+    if (r != nullptr) engine.process (l, r, n, scL, scR);
     else
     {
         // mono out: run in stereo on a scratch copy
         juce::HeapBlock<float> tmp ((size_t) n);
         std::copy (l, l + n, tmp.get());
-        engine.process (l, tmp.get(), n);
+        engine.process (l, tmp.get(), n, scL, scR);
         for (int i = 0; i < n; ++i) l[i] = 0.5f * (l[i] + tmp[i]);
     }
 }

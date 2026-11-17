@@ -44,6 +44,7 @@ const Program kPrograms[] = {
     { "Harmonizer",       Category::Pitch, Algo::Harmonizer, "Interval", "Blend" },
     { "Doubler",          Category::Pitch, Algo::Doubler,    "Detune",   "Spread" },
     { "Pitch Delay",      Category::Pitch, Algo::PitchDelay, "Shift",    "Feedback" },
+    { "Vocoder",          Category::Pitch, Algo::Vocoder,    "Note",     "Formant" },
     // Grain / Loop
     { "Beat Repeat",      Category::GrainLoop, Algo::BeatRepeat,  "Length",     "Speed" },
     { "Reverse Loop",     Category::GrainLoop, Algo::ReverseLoop, "Length",     "Speed" },
@@ -64,6 +65,8 @@ const Program kPrograms[] = {
     { "Drone",            Category::Synth, Algo::Drone,      "Root",  "Brightness" },
     { "Siren",            Category::Synth, Algo::Siren,      "Speed", "Pitch" },
     { "Noise Riser",      Category::Synth, Algo::NoiseRiser, "Sweep", "Resonance" },
+    { "Drum Roll",        Category::Synth, Algo::DrumRoll,   "Roll Rate", "Kick/Snare/Hat" },
+    { "Beat Loop",        Category::Synth, Algo::BeatLoop,   "Pattern",   "Tone" },
 };
 } // namespace
 

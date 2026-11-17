@@ -64,6 +64,7 @@ private:
     void handleMidi (const juce::MidiBuffer&);
     void setParamFromAudio (const juce::String& id, float plainValue);
 
+    juce::AudioBuffer<float> sideChain;
     std::atomic<float> lastHostBpm { 120.0f };
     std::atomic<bool> lastHostPlaying { false };
 

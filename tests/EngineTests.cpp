@@ -17,7 +17,7 @@ struct Run
     Engine e;
     Params p;
     Rng rng;
-    std::vector<float> l, r;
+    std::vector<float> l, r, side;
     Run() { l.resize (BLOCK); r.resize (BLOCK); e.setParams (p); e.prepare (SR, BLOCK); }
     // feeds noise (or silence), returns peak and rms of the output
     void go (int blocks, bool noise, float& peak, double& rms, float amp = 0.3f)
@@ -28,7 +28,8 @@ struct Run
         {
             for (int i = 0; i < BLOCK; ++i) { l[(size_t) i] = noise ? rng.next() * amp : 0.0f; r[(size_t) i] = noise ? rng.next() * amp : 0.0f; }
             e.setParams (p);
-            e.process (l.data(), r.data(), BLOCK);
+            e.process (l.data(), r.data(), BLOCK, side.empty() ? nullptr : side.data());
+            if (p.hostPlaying) p.ppq += (double) BLOCK * p.bpm / 60.0 / SR;
             for (int i = 0; i < BLOCK; ++i)
             {
                 const float a = std::fabs (l[(size_t) i]), c = std::fabs (r[(size_t) i]);
@@ -165,8 +166,74 @@ static void testBeatRepeatLoops()
     CHECK (rms > 1e-2, "beat repeat should loop captured audio (rms %g)", rms);
 }
 
+static void testBarLockedRecording()
+{
+    Run run;
+    run.p.bpm = 120; run.p.bankBeats = 4; run.p.hostPlaying = true; run.p.ppq = 0.5;
+    float pk; double rms;
+    run.go (1, true, pk, rms);
+    run.e.bankPress (0);
+    run.go (2, true, pk, rms);
+    CHECK (run.e.bankState (0) == BankState::Armed, "a 4-beat loop should wait for the next bar");
+    // beat 0.5 -> 3.9: still armed (no downbeat yet)
+    while (run.p.ppq < 3.9) run.go (1, true, pk, rms);
+    CHECK (run.e.bankState (0) == BankState::Armed, "still armed before the downbeat (ppq %.2f)", run.p.ppq);
+    while (run.p.ppq < 4.1) run.go (1, true, pk, rms);
+    CHECK (run.e.bankState (0) == BankState::Recording, "recording should start on beat 4");
+    while (run.p.ppq < 8.2) run.go (1, true, pk, rms);
+    CHECK (run.e.bankState (0) == BankState::Playing, "loop plays after one bar");
+    // playback follows the song position: jumping the host back to the loop start puts the head at 0
+    run.p.ppq = 12.0;
+    run.go (1, false, pk, rms);
+    CHECK (run.e.bankProgress (0) < 0.05f, "bar-locked head should be near the loop start (progress %g)", run.e.bankProgress (0));
+}
+
+static void testVocoder()
+{
+    int count = 0;
+    auto* progs = programs (count);
+    int voc = -1;
+    for (int i = 0; i < count; ++i) if (progs[i].algo == Algo::Vocoder) voc = i;
+    CHECK (voc >= 0, "vocoder program missing");
+    Run run;
+    run.p.program = voc; run.p.touch = true;
+    float pk; double withInput, silent;
+    run.go (100, true, pk, withInput);
+    run.go (50, false, pk, silent);    // let the band filters ring out
+    run.go (100, false, pk, silent);
+    CHECK (withInput > 0.01, "vocoder should speak with input (rms %g)", withInput);
+    CHECK (silent < withInput * 0.2, "vocoder should be quiet without a modulator (%g vs %g)", silent, withInput);
+    // external carrier through the sidechain
+    run.side.assign (BLOCK, 0.0f);
+    for (int i = 0; i < BLOCK; ++i) run.side[(size_t) i] = 0.3f * std::sin ((float) i * 0.11f);
+    run.go (100, true, pk, withInput);
+    CHECK (withInput > 0.005 && pk < 4.0f, "vocoder with a sidechain carrier (rms %g)", withInput);
+}
+
+static void testDrums()
+{
+    int count = 0;
+    auto* progs = programs (count);
+    for (int i = 0; i < count; ++i)
+    {
+        if (progs[i].algo != Algo::DrumRoll && progs[i].algo != Algo::BeatLoop) continue;
+        Run run;
+        run.p.program = i; run.p.touch = true; run.p.x = 0.2f; run.p.y = 0.1f;
+        float pk; double rms;
+        run.go (200, false, pk, rms);   // silent input: the drums alone
+        CHECK (rms > 0.01, "%s should play from the pad (rms %g)", progs[i].name, rms);
+        run.p.touch = false;
+        run.go (100, false, pk, rms);
+        run.go (20, false, pk, rms);
+        CHECK (pk < 1e-3f, "%s should stop after release (peak %g)", progs[i].name, pk);
+    }
+}
+
 int main()
 {
+    testBarLockedRecording();
+    testVocoder();
+    testDrums();
     testAllProgramsStable();
     testReleaseBypassIsDry();
     testLowPassCutsHighs();

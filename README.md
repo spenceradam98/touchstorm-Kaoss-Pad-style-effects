@@ -1,7 +1,7 @@
 # Touchstorm (working name)
 
-An XY touch-pad effects processor and loop sampler (VST3 + standalone): 50 effect programs in
-8 categories, Hold, Pad Motion, tap/host tempo, 4 loop banks, 8 memories, MIDI control and
+An XY touch-pad effects processor and loop sampler (VST3 + standalone): 53 effect programs in
+8 categories (vocoder and drum programs included), Hold, Pad Motion, tap/host tempo, 4 loop banks, 8 memories, MIDI control and
 5 UI themes. See `docs/DESIGN.md`.
 
 ## Build

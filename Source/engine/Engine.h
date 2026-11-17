@@ -20,13 +20,13 @@ enum class Algo
     // Reverb (tails)
     Hall, Room, Shimmer, GatedVerb, DelayVerb,
     // Pitch
-    PitchShift, Harmonizer, Doubler, PitchDelay,
+    PitchShift, Harmonizer, Doubler, PitchDelay, Vocoder,
     // Grain / Loop (captures the input when the pad is touched)
     BeatRepeat, ReverseLoop, GrainShift, TapeStop, Scratch, Freeze,
     // Lo-Fi
     BitCrush, Decimator, Overdrive, Fuzz, Radio, Vinyl,
     // Synth (plays on top of the input while the pad is touched)
-    LeadSynth, BassSynth, Drone, Siren, NoiseRiser,
+    LeadSynth, BassSynth, Drone, Siren, NoiseRiser, DrumRoll, BeatLoop,
     Count
 };
 
@@ -81,8 +81,8 @@ public:
 
     void prepare (double sampleRate, int maxBlock);
     void setParams (const Params& p);
-    // stereo, in place
-    void process (float* left, float* right, int numSamples);
+    // stereo, in place. The optional sidechain is the vocoder's external carrier.
+    void process (float* left, float* right, int numSamples, const float* sideL = nullptr, const float* sideR = nullptr);
 
     // Loop banks (A..D). Press: Empty -> record (starts on the next beat when the host plays),
     // Recording -> stop early and play, Playing <-> Stopped. clear() empties a bank.
